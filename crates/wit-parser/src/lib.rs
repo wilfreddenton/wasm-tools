@@ -23,6 +23,15 @@ pub type IndexSet<T> = indexmap::IndexSet<T, std::hash::RandomState>;
 pub type IndexMap<K, V> = indexmap::IndexMap<K, V, ahash::RandomState>;
 #[cfg(not(feature = "std"))]
 pub type IndexSet<T> = indexmap::IndexSet<T, ahash::RandomState>;
+
+#[cfg(feature = "std")]
+pub(crate) use std::collections::{HashMap, HashSet};
+
+#[cfg(not(feature = "std"))]
+mod collections;
+#[cfg(not(feature = "std"))]
+pub(crate) use collections::{HashMap, HashSet};
+
 use alloc::borrow::Cow;
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -671,7 +680,7 @@ impl TypeDefKind {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum TypeOwner {
