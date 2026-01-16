@@ -88,6 +88,16 @@ impl<'a> Cloner<'a> {
     }
 
     pub fn world_item(&mut self, key: &WorldKey, item: &mut WorldItem, clone_maps: &mut CloneMaps) {
+        self.world_item_with_original_name(key, item, clone_maps, None)
+    }
+
+    pub fn world_item_with_original_name(
+        &mut self,
+        key: &WorldKey,
+        item: &mut WorldItem,
+        clone_maps: &mut CloneMaps,
+        original_name: Option<&str>,
+    ) {
         match key {
             WorldKey::Name(_) => {}
             WorldKey::Interface(_) => return,
@@ -99,6 +109,16 @@ impl<'a> Cloner<'a> {
             }
             WorldItem::Function(f) => {
                 self.function(f);
+                // Copy function span from old owner to new owner
+                if let WorldKey::Name(new_name) = key {
+                    let old_name = original_name.unwrap_or(new_name);
+                    let lookup_key = (self.prev_owner, old_name.to_string());
+                    if let Some(span) = self.resolve.function_spans.get(&lookup_key).copied() {
+                        self.resolve
+                            .function_spans
+                            .insert((self.new_owner, new_name.clone()), span);
+                    }
+                }
             }
             WorldItem::Interface { id, .. } => {
                 let old = *id;
@@ -113,6 +133,10 @@ impl<'a> Cloner<'a> {
             let mut new = self.resolve.types[*ty].clone();
             self.type_def(&mut new);
             let id = self.resolve.types.alloc(new);
+            // Copy span if present
+            if let Some(span) = self.resolve.type_spans.get(ty).copied() {
+                self.resolve.type_spans.insert(id, span);
+            }
             self.types.insert(*ty, id);
         }
         *ty = self.types[&*ty];
@@ -201,6 +225,7 @@ impl<'a> Cloner<'a> {
     }
 
     fn interface(&mut self, id: &mut InterfaceId, cloned_types: &mut HashMap<TypeId, TypeId>) {
+        let old_id = *id;
         let mut new = self.resolve.interfaces[*id].clone();
         let next_id = self.resolve.interfaces.next_id();
         let mut clone = Cloner::new(
@@ -222,5 +247,24 @@ impl<'a> Cloner<'a> {
         }));
         *id = self.resolve.interfaces.alloc(new);
         assert_eq!(*id, next_id);
+
+        // Copy interface span if present
+        if let Some(span) = self.resolve.interface_spans.get(&old_id).copied() {
+            self.resolve.interface_spans.insert(*id, span);
+        }
+        // Copy function spans for the cloned interface
+        let new_iface = &self.resolve.interfaces[*id];
+        for func_name in new_iface.functions.keys() {
+            if let Some(span) = self
+                .resolve
+                .function_spans
+                .get(&(TypeOwner::Interface(old_id), func_name.clone()))
+                .copied()
+            {
+                self.resolve
+                    .function_spans
+                    .insert((TypeOwner::Interface(*id), func_name.clone()), span);
+            }
+        }
     }
 }

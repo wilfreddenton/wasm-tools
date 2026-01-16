@@ -99,6 +99,24 @@ pub struct Resolve {
     /// Activate all features for this [`Resolve`].
     #[cfg_attr(feature = "serde", serde(skip))]
     pub all_features: bool,
+
+    /// Source spans for types parsed from WIT text.
+    /// Types from binary components will not have entries here.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub type_spans: HashMap<TypeId, Span>,
+
+    /// Source spans for interfaces parsed from WIT text.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub interface_spans: HashMap<InterfaceId, Span>,
+
+    /// Source spans for worlds parsed from WIT text.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub world_spans: HashMap<WorldId, Span>,
+
+    /// Source spans for functions parsed from WIT text.
+    /// Key is (owner, function name) where owner is the interface or world containing the function.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub function_spans: HashMap<(TypeOwner, String), Span>,
 }
 
 /// A WIT package within a `Resolve`.
@@ -477,6 +495,10 @@ package {name} is defined in two different locations:\n\
             packages,
             package_names,
             features: _,
+            type_spans,
+            interface_spans,
+            world_spans,
+            function_spans,
             ..
         } = resolve;
 
@@ -633,6 +655,41 @@ package {name} is defined in two different locations:\n\
         }
 
         log::trace!("now have {} packages", self.packages.len());
+
+        // Copy span maps with remapped IDs
+        for (old_id, span) in type_spans {
+            if let Some(new_id) = remap.types.get(old_id.index()).and_then(|x| *x) {
+                self.type_spans.insert(new_id, span);
+            }
+        }
+        for (old_id, span) in interface_spans {
+            if let Some(new_id) = remap.interfaces.get(old_id.index()).and_then(|x| *x) {
+                self.interface_spans.insert(new_id, span);
+            }
+        }
+        for (old_id, span) in world_spans {
+            if let Some(new_id) = remap.worlds.get(old_id.index()).and_then(|x| *x) {
+                self.world_spans.insert(new_id, span);
+            }
+        }
+        for ((owner, name), span) in function_spans {
+            let new_owner = match owner {
+                TypeOwner::Interface(id) => remap
+                    .interfaces
+                    .get(id.index())
+                    .and_then(|x| *x)
+                    .map(TypeOwner::Interface),
+                TypeOwner::World(id) => remap
+                    .worlds
+                    .get(id.index())
+                    .and_then(|x| *x)
+                    .map(TypeOwner::World),
+                TypeOwner::None => Some(TypeOwner::None),
+            };
+            if let Some(new_owner) = new_owner {
+                self.function_spans.insert((new_owner, name), span);
+            }
+        }
 
         #[cfg(debug_assertions)]
         self.assert_valid();
@@ -2845,7 +2902,7 @@ impl Remap {
         // the one we're referring to is already expanded and ready to be
         // included.
         assert_eq!(self.worlds.len(), unresolved.world_spans.len());
-        for (id, span) in self
+        for (id, world_span) in self
             .worlds
             .iter()
             .zip(unresolved.world_spans.iter())
@@ -2854,11 +2911,29 @@ impl Remap {
             let Some(id) = *id else {
                 continue;
             };
-            self.process_world_includes(id, resolve, &pkgid, &span)?;
+
+            // Populate world/function spans before includes so they're available for copying
+            resolve.world_spans.insert(id, world_span.span);
+            for ((key, item), span) in resolve.worlds[id].exports.iter().zip(&world_span.exports) {
+                if let (WorldKey::Name(name), WorldItem::Function(_)) = (key, item) {
+                    resolve
+                        .function_spans
+                        .insert((TypeOwner::World(id), name.clone()), *span);
+                }
+            }
+            for ((key, item), span) in resolve.worlds[id].imports.iter().zip(&world_span.imports) {
+                if let (WorldKey::Name(name), WorldItem::Function(_)) = (key, item) {
+                    resolve
+                        .function_spans
+                        .insert((TypeOwner::World(id), name.clone()), *span);
+                }
+            }
+
+            self.process_world_includes(id, resolve, &pkgid, &world_span)?;
 
             resolve.elaborate_world(id).with_context(|| {
                 Error::new(
-                    span.span,
+                    world_span.span,
                     format!(
                         "failed to elaborate world imports/exports of `{}`",
                         resolve.worlds[id].name
@@ -2892,6 +2967,34 @@ impl Remap {
                 .insert(world.name.clone(), id);
             assert!(prev.is_none());
         }
+
+        // Bulk copy all spans with remapped IDs
+        for (old_idx, span) in unresolved.type_spans.iter().enumerate().skip(foreign_types) {
+            if let Some(new_id) = self.types.get(old_idx).and_then(|x| *x) {
+                resolve.type_spans.insert(new_id, *span);
+            }
+        }
+
+        for (old_idx, iface_span) in unresolved
+            .interface_spans
+            .iter()
+            .enumerate()
+            .skip(foreign_interfaces)
+        {
+            if let Some(new_id) = self.interfaces.get(old_idx).and_then(|x| *x) {
+                resolve.interface_spans.insert(new_id, iface_span.span);
+
+                // Copy function spans for this interface
+                let iface = &resolve.interfaces[new_id];
+                for (func_name, func_span) in iface.functions.keys().zip(&iface_span.funcs) {
+                    resolve.function_spans.insert(
+                        (TypeOwner::Interface(new_id), func_name.clone()),
+                        *func_span,
+                    );
+                }
+            }
+        }
+
         Ok(pkgid)
     }
 
@@ -3560,11 +3663,11 @@ impl Remap {
         is_external_include: bool,
     ) -> Result<()> {
         match item.0 {
-            WorldKey::Name(n) => {
+            WorldKey::Name(original_name) => {
                 let n = names
                     .into_iter()
-                    .find_map(|include_name| rename(n, include_name))
-                    .unwrap_or(n.clone());
+                    .find_map(|include_name| rename(original_name, include_name))
+                    .unwrap_or(original_name.clone());
 
                 // When the `with` option to the `include` directive is
                 // specified and is used to rename a function that means that
@@ -3573,7 +3676,12 @@ impl Remap {
                 // in the function itself.
                 let mut new_item = item.1.clone();
                 let key = WorldKey::Name(n.clone());
-                cloner.world_item(&key, &mut new_item, &mut CloneMaps::default());
+                cloner.world_item_with_original_name(
+                    &key,
+                    &mut new_item,
+                    &mut CloneMaps::default(),
+                    Some(original_name),
+                );
                 match &mut new_item {
                     WorldItem::Function(f) => f.name = n.clone(),
                     WorldItem::Type(id) => cloner.resolve.types[*id].name = Some(n.clone()),
@@ -4086,6 +4194,7 @@ impl core::error::Error for InvalidTransitiveDependency {}
 #[cfg(test)]
 mod tests {
     use crate::Resolve;
+    use alloc::string::ToString;
     use anyhow::Result;
 
     #[test]
@@ -4451,6 +4560,210 @@ mod tests {
             resolve
                 .select_world(&[wit2], Some("example:wit2/foo"))
                 .is_ok()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn span_preservation() -> Result<()> {
+        use crate::TypeOwner;
+
+        let mut resolve = Resolve::default();
+        let pkg = resolve.push_str(
+            "test.wit",
+            r#"
+                package foo:bar;
+
+                interface my-iface {
+                    type my-type = u32;
+                    my-func: func();
+                }
+
+                world my-world {
+                    export my-export: func();
+                }
+            "#,
+        )?;
+
+        let iface_id = resolve.packages[pkg].interfaces["my-iface"];
+        assert!(resolve.interface_spans.contains_key(&iface_id));
+
+        let type_id = resolve.interfaces[iface_id].types["my-type"];
+        assert!(resolve.type_spans.contains_key(&type_id));
+
+        assert!(
+            resolve
+                .function_spans
+                .contains_key(&(TypeOwner::Interface(iface_id), "my-func".to_string()))
+        );
+
+        let world_id = resolve.packages[pkg].worlds["my-world"];
+        assert!(resolve.world_spans.contains_key(&world_id));
+
+        assert!(
+            resolve
+                .function_spans
+                .contains_key(&(TypeOwner::World(world_id), "my-export".to_string()))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn span_preservation_through_merge() -> Result<()> {
+        use crate::TypeOwner;
+
+        let mut resolve1 = Resolve::default();
+        resolve1.push_str(
+            "test1.wit",
+            r#"
+                package foo:bar;
+
+                interface iface1 {
+                    type type1 = u32;
+                    func1: func();
+                }
+            "#,
+        )?;
+
+        let mut resolve2 = Resolve::default();
+        let pkg2 = resolve2.push_str(
+            "test2.wit",
+            r#"
+                package foo:baz;
+
+                interface iface2 {
+                    type type2 = string;
+                    func2: func();
+                }
+            "#,
+        )?;
+
+        let iface2_old_id = resolve2.packages[pkg2].interfaces["iface2"];
+        let remap = resolve1.merge(resolve2)?;
+        let iface2_id = remap.interfaces[iface2_old_id.index()].unwrap();
+
+        assert!(resolve1.interface_spans.contains_key(&iface2_id));
+
+        let type2_id = resolve1.interfaces[iface2_id].types["type2"];
+        assert!(resolve1.type_spans.contains_key(&type2_id));
+
+        assert!(
+            resolve1
+                .function_spans
+                .contains_key(&(TypeOwner::Interface(iface2_id), "func2".to_string()))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn span_preservation_through_include() -> Result<()> {
+        use crate::TypeOwner;
+
+        let mut resolve = Resolve::default();
+        let pkg = resolve.push_str(
+            "test.wit",
+            r#"
+                package foo:bar;
+
+                world base {
+                    export my-func: func();
+                }
+
+                world extended {
+                    include base;
+                }
+            "#,
+        )?;
+
+        let base_id = resolve.packages[pkg].worlds["base"];
+        let extended_id = resolve.packages[pkg].worlds["extended"];
+
+        assert!(
+            resolve
+                .function_spans
+                .contains_key(&(TypeOwner::World(base_id), "my-func".to_string()))
+        );
+        assert!(
+            resolve
+                .function_spans
+                .contains_key(&(TypeOwner::World(extended_id), "my-func".to_string()))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn span_preservation_through_include_with_rename() -> Result<()> {
+        use crate::TypeOwner;
+
+        let mut resolve = Resolve::default();
+        let pkg = resolve.push_str(
+            "test.wit",
+            r#"
+                package foo:bar;
+
+                world base {
+                    export original-name: func();
+                }
+
+                world extended {
+                    include base with { original-name as renamed-func }
+                }
+            "#,
+        )?;
+
+        let extended_id = resolve.packages[pkg].worlds["extended"];
+
+        assert!(
+            resolve
+                .function_spans
+                .contains_key(&(TypeOwner::World(extended_id), "renamed-func".to_string()))
+        );
+        assert!(
+            !resolve
+                .function_spans
+                .contains_key(&(TypeOwner::World(extended_id), "original-name".to_string()))
+        );
+
+        Ok(())
+    }
+
+    /// Test that spans work when included world is defined after the including world
+    #[test]
+    fn span_preservation_through_include_reverse_order() -> Result<()> {
+        use crate::TypeOwner;
+
+        let mut resolve = Resolve::default();
+        let pkg = resolve.push_str(
+            "test.wit",
+            r#"
+                package foo:bar;
+
+                world extended {
+                    include base;
+                }
+
+                world base {
+                    export my-func: func();
+                }
+            "#,
+        )?;
+
+        let base_id = resolve.packages[pkg].worlds["base"];
+        let extended_id = resolve.packages[pkg].worlds["extended"];
+
+        assert!(
+            resolve
+                .function_spans
+                .contains_key(&(TypeOwner::World(base_id), "my-func".to_string()))
+        );
+        assert!(
+            resolve
+                .function_spans
+                .contains_key(&(TypeOwner::World(extended_id), "my-func".to_string()))
         );
 
         Ok(())
