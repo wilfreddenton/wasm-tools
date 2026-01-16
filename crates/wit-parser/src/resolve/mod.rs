@@ -117,6 +117,11 @@ pub struct Resolve {
     /// Key is (owner, function name) where owner is the interface or world containing the function.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub function_spans: HashMap<(TypeOwner, String), Span>,
+
+    /// Source maps for converting spans to file locations.
+    /// Use [`Resolve::render_location`] to convert a span to a human-readable location.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub source_maps: Vec<SourceMap>,
 }
 
 /// A WIT package within a `Resolve`.
@@ -330,17 +335,21 @@ package {name} is defined in two different locations:\n\
         // the same `SourceMap`.
         let mut package_id_to_source_map_idx = BTreeMap::new();
         let mut main_pkg_id = None;
+        let source_map_base = u32::try_from(self.source_maps.len()).unwrap();
         for name in order {
             let (pkg, source_map_index) = pkg_details_map.remove(&name).unwrap();
             let source_map = &source_maps[source_map_index];
             let is_main = pkg.name == main_name;
-            let id = self.push(pkg, source_map)?;
+            let final_source_map_index = source_map_base + u32::try_from(source_map_index).unwrap();
+            let id = self.push_with_source_map_index(pkg, source_map, final_source_map_index)?;
             if is_main {
                 assert!(main_pkg_id.is_none());
                 main_pkg_id = Some(id);
             }
             package_id_to_source_map_idx.insert(id, source_map_index);
         }
+
+        self.source_maps.extend(source_maps.iter().cloned());
 
         Ok((
             main_pkg_id.unwrap(),
@@ -363,7 +372,17 @@ package {name} is defined in two different locations:\n\
         unresolved: UnresolvedPackage,
         source_map: &SourceMap,
     ) -> Result<PackageId> {
-        let ret = source_map.rewrite_error(|| Remap::default().append(self, unresolved));
+        self.push_with_source_map_index(unresolved, source_map, 0)
+    }
+
+    fn push_with_source_map_index(
+        &mut self,
+        unresolved: UnresolvedPackage,
+        source_map: &SourceMap,
+        source_map_index: u32,
+    ) -> Result<PackageId> {
+        let ret = source_map
+            .rewrite_error(|| Remap::default().append(self, unresolved, source_map_index));
         if ret.is_ok() {
             #[cfg(debug_assertions)]
             self.assert_valid();
@@ -392,6 +411,16 @@ package {name} is defined in two different locations:\n\
     /// are the contents of a WIT package.
     pub fn push_source(&mut self, path: &str, contents: &str) -> Result<PackageId> {
         self.push_group(UnresolvedPackageGroup::parse_str(path, contents)?)
+    }
+
+    /// Renders a span as a human-readable location string (e.g., "file.wit:10:5").
+    ///
+    /// Returns `None` if no source map contains the given span (e.g., for items
+    /// loaded from binary format).
+    pub fn render_location(&self, span: Span) -> Option<String> {
+        self.source_maps
+            .get(span.source_map as usize)
+            .map(|source_map| source_map.render_location(span))
     }
 
     pub fn all_bits_valid(&self, ty: &Type) -> bool {
@@ -499,6 +528,7 @@ package {name} is defined in two different locations:\n\
             interface_spans,
             world_spans,
             function_spans,
+            source_maps,
             ..
         } = resolve;
 
@@ -656,23 +686,26 @@ package {name} is defined in two different locations:\n\
 
         log::trace!("now have {} packages", self.packages.len());
 
-        // Copy span maps with remapped IDs
-        for (old_id, span) in type_spans {
+        let source_map_offset = u32::try_from(self.source_maps.len()).unwrap();
+        for (old_id, mut span) in type_spans {
             if let Some(new_id) = remap.types.get(old_id.index()).and_then(|x| *x) {
+                span.source_map += source_map_offset;
                 self.type_spans.insert(new_id, span);
             }
         }
-        for (old_id, span) in interface_spans {
+        for (old_id, mut span) in interface_spans {
             if let Some(new_id) = remap.interfaces.get(old_id.index()).and_then(|x| *x) {
+                span.source_map += source_map_offset;
                 self.interface_spans.insert(new_id, span);
             }
         }
-        for (old_id, span) in world_spans {
+        for (old_id, mut span) in world_spans {
             if let Some(new_id) = remap.worlds.get(old_id.index()).and_then(|x| *x) {
+                span.source_map += source_map_offset;
                 self.world_spans.insert(new_id, span);
             }
         }
-        for ((owner, name), span) in function_spans {
+        for ((owner, name), mut span) in function_spans {
             let new_owner = match owner {
                 TypeOwner::Interface(id) => remap
                     .interfaces
@@ -687,9 +720,12 @@ package {name} is defined in two different locations:\n\
                 TypeOwner::None => Some(TypeOwner::None),
             };
             if let Some(new_owner) = new_owner {
+                span.source_map += source_map_offset;
                 self.function_spans.insert((new_owner, name), span);
             }
         }
+
+        self.source_maps.extend(source_maps);
 
         #[cfg(debug_assertions)]
         self.assert_valid();
@@ -2715,6 +2751,7 @@ impl Remap {
         &mut self,
         resolve: &mut Resolve,
         unresolved: UnresolvedPackage,
+        source_map_index: u32,
     ) -> Result<PackageId> {
         let pkgid = resolve.packages.alloc(Package {
             name: unresolved.name.clone(),
@@ -2913,19 +2950,25 @@ impl Remap {
             };
 
             // Populate world/function spans before includes so they're available for copying
-            resolve.world_spans.insert(id, world_span.span);
+            let mut span = world_span.span;
+            span.source_map = source_map_index;
+            resolve.world_spans.insert(id, span);
             for ((key, item), span) in resolve.worlds[id].exports.iter().zip(&world_span.exports) {
                 if let (WorldKey::Name(name), WorldItem::Function(_)) = (key, item) {
+                    let mut span = *span;
+                    span.source_map = source_map_index;
                     resolve
                         .function_spans
-                        .insert((TypeOwner::World(id), name.clone()), *span);
+                        .insert((TypeOwner::World(id), name.clone()), span);
                 }
             }
             for ((key, item), span) in resolve.worlds[id].imports.iter().zip(&world_span.imports) {
                 if let (WorldKey::Name(name), WorldItem::Function(_)) = (key, item) {
+                    let mut span = *span;
+                    span.source_map = source_map_index;
                     resolve
                         .function_spans
-                        .insert((TypeOwner::World(id), name.clone()), *span);
+                        .insert((TypeOwner::World(id), name.clone()), span);
                 }
             }
 
@@ -2971,7 +3014,9 @@ impl Remap {
         // Bulk copy all spans with remapped IDs
         for (old_idx, span) in unresolved.type_spans.iter().enumerate().skip(foreign_types) {
             if let Some(new_id) = self.types.get(old_idx).and_then(|x| *x) {
-                resolve.type_spans.insert(new_id, *span);
+                let mut span = *span;
+                span.source_map = source_map_index;
+                resolve.type_spans.insert(new_id, span);
             }
         }
 
@@ -2982,15 +3027,18 @@ impl Remap {
             .skip(foreign_interfaces)
         {
             if let Some(new_id) = self.interfaces.get(old_idx).and_then(|x| *x) {
-                resolve.interface_spans.insert(new_id, iface_span.span);
+                let mut span = iface_span.span;
+                span.source_map = source_map_index;
+                resolve.interface_spans.insert(new_id, span);
 
                 // Copy function spans for this interface
                 let iface = &resolve.interfaces[new_id];
                 for (func_name, func_span) in iface.functions.keys().zip(&iface_span.funcs) {
-                    resolve.function_spans.insert(
-                        (TypeOwner::Interface(new_id), func_name.clone()),
-                        *func_span,
-                    );
+                    let mut func_span = *func_span;
+                    func_span.source_map = source_map_index;
+                    resolve
+                        .function_spans
+                        .insert((TypeOwner::Interface(new_id), func_name.clone()), func_span);
                 }
             }
         }
@@ -4659,6 +4707,62 @@ mod tests {
     }
 
     #[test]
+    fn span_line_numbers_through_merge() -> Result<()> {
+        use crate::TypeOwner;
+
+        let mut resolve1 = Resolve::default();
+        resolve1.push_source(
+            "first.wit",
+            "package foo:first;
+
+interface iface1 {
+    func1: func();
+}
+",
+        )?;
+
+        let mut resolve2 = Resolve::default();
+        let pkg2 = resolve2.push_source(
+            "second.wit",
+            "package foo:second;
+
+interface iface2 {
+    func2: func();
+}
+",
+        )?;
+
+        let iface2_old_id = resolve2.packages[pkg2].interfaces["iface2"];
+        let remap = resolve1.merge(resolve2)?;
+        let iface2_id = remap.interfaces[iface2_old_id.index()].unwrap();
+
+        let iface2_span = resolve1.interface_spans[&iface2_id];
+        let iface2_loc = resolve1.render_location(iface2_span).unwrap();
+        assert!(
+            iface2_loc.contains("second.wit"),
+            "should reference second.wit, got {iface2_loc}"
+        );
+        assert!(
+            iface2_loc.contains(":3:"),
+            "interface should be on line 3, got {iface2_loc}"
+        );
+
+        let func2_span =
+            resolve1.function_spans[&(TypeOwner::Interface(iface2_id), "func2".to_string())];
+        let func2_loc = resolve1.render_location(func2_span).unwrap();
+        assert!(
+            func2_loc.contains("second.wit"),
+            "should reference second.wit, got {func2_loc}"
+        );
+        assert!(
+            func2_loc.contains(":4:"),
+            "function should be on line 4, got {func2_loc}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn span_preservation_through_include() -> Result<()> {
         use crate::TypeOwner;
 
@@ -4764,6 +4868,137 @@ mod tests {
             resolve
                 .function_spans
                 .contains_key(&(TypeOwner::World(extended_id), "my-func".to_string()))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn span_line_numbers() -> Result<()> {
+        use crate::TypeOwner;
+
+        let mut resolve = Resolve::default();
+        let pkg = resolve.push_source(
+            "test.wit",
+            "package foo:bar;
+
+interface my-iface {
+    type my-type = u32;
+    my-func: func();
+}
+
+world my-world {
+    export my-export: func();
+}
+",
+        )?;
+
+        let iface_id = resolve.packages[pkg].interfaces["my-iface"];
+        let iface_span = resolve.interface_spans[&iface_id];
+        let iface_loc = resolve.render_location(iface_span).unwrap();
+        assert!(
+            iface_loc.contains(":3:"),
+            "interface location was {iface_loc}"
+        );
+
+        let type_id = resolve.interfaces[iface_id].types["my-type"];
+        let type_span = resolve.type_spans[&type_id];
+        let type_loc = resolve.render_location(type_span).unwrap();
+        assert!(type_loc.contains(":4:"), "type location was {type_loc}");
+
+        let func_span =
+            resolve.function_spans[&(TypeOwner::Interface(iface_id), "my-func".to_string())];
+        let func_loc = resolve.render_location(func_span).unwrap();
+        assert!(func_loc.contains(":5:"), "function location was {func_loc}");
+
+        let world_id = resolve.packages[pkg].worlds["my-world"];
+        let world_span = resolve.world_spans[&world_id];
+        let world_loc = resolve.render_location(world_span).unwrap();
+        assert!(world_loc.contains(":8:"), "world location was {world_loc}");
+
+        let export_span =
+            resolve.function_spans[&(TypeOwner::World(world_id), "my-export".to_string())];
+        let export_loc = resolve.render_location(export_span).unwrap();
+        assert!(
+            export_loc.contains(":9:"),
+            "export location was {export_loc}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn span_line_numbers_multiple_sources() -> Result<()> {
+        use crate::TypeOwner;
+
+        let mut resolve = Resolve::default();
+
+        let pkg1 = resolve.push_source(
+            "first.wit",
+            "package test:first;
+
+interface first-iface {
+    first-func: func();
+}
+",
+        )?;
+
+        let pkg2 = resolve.push_source(
+            "second.wit",
+            "package test:second;
+
+interface second-iface {
+    second-func: func();
+}
+",
+        )?;
+
+        let iface1_id = resolve.packages[pkg1].interfaces["first-iface"];
+        let iface1_span = resolve.interface_spans[&iface1_id];
+        let iface1_loc = resolve.render_location(iface1_span).unwrap();
+        assert!(
+            iface1_loc.contains("first.wit"),
+            "should reference first.wit, got {iface1_loc}"
+        );
+        assert!(
+            iface1_loc.contains(":3:"),
+            "interface should be on line 3, got {iface1_loc}"
+        );
+
+        let func1_span =
+            resolve.function_spans[&(TypeOwner::Interface(iface1_id), "first-func".to_string())];
+        let func1_loc = resolve.render_location(func1_span).unwrap();
+        assert!(
+            func1_loc.contains("first.wit"),
+            "should reference first.wit, got {func1_loc}"
+        );
+        assert!(
+            func1_loc.contains(":4:"),
+            "function should be on line 4, got {func1_loc}"
+        );
+
+        let iface2_id = resolve.packages[pkg2].interfaces["second-iface"];
+        let iface2_span = resolve.interface_spans[&iface2_id];
+        let iface2_loc = resolve.render_location(iface2_span).unwrap();
+        assert!(
+            iface2_loc.contains("second.wit"),
+            "should reference second.wit, got {iface2_loc}"
+        );
+        assert!(
+            iface2_loc.contains(":3:"),
+            "interface should be on line 3, got {iface2_loc}"
+        );
+
+        let func2_span =
+            resolve.function_spans[&(TypeOwner::Interface(iface2_id), "second-func".to_string())];
+        let func2_loc = resolve.render_location(func2_span).unwrap();
+        assert!(
+            func2_loc.contains("second.wit"),
+            "should reference second.wit, got {func2_loc}"
+        );
+        assert!(
+            func2_loc.contains(":4:"),
+            "function should be on line 4, got {func2_loc}"
         );
 
         Ok(())
